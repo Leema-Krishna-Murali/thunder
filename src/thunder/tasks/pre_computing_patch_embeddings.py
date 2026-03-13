@@ -1,6 +1,7 @@
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
+import logging
 
 import h5py
 import numpy as np
@@ -12,6 +13,30 @@ from transformers.models.vit.modeling_vit import ViTModel
 
 from ..models.pretrained_models import load_pretrained_model
 from ..utils.data import PatchDataset, get_data
+
+
+def _normalize_id_to_classname(id_to_classname: Mapping) -> dict[int, str]:
+    """Normalize class-id mapping to contiguous integer keys."""
+    normalized_mapping = {}
+    for raw_class_id, classname in id_to_classname.items():
+        try:
+            class_id = int(raw_class_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid class id {raw_class_id!r} in id_to_classname mapping. "
+                "Class ids must be integers."
+            ) from exc
+        normalized_mapping[class_id] = classname
+
+    expected_ids = set(range(len(normalized_mapping)))
+    found_ids = set(normalized_mapping.keys())
+    if found_ids != expected_ids:
+        raise ValueError(
+            "id_to_classname mapping must define contiguous class ids from 0 to "
+            f"{len(normalized_mapping) - 1}. Found ids: {sorted(found_ids)}."
+        )
+
+    return {i: normalized_mapping[i] for i in range(len(normalized_mapping))}
 
 
 def pre_computing_patch_embeddings(
@@ -70,7 +95,35 @@ def pre_computing_patch_embeddings(
         dataset_task_type = "linear_probing"
     else:
         dataset_task_type = "segmentation"
-    for split in ["train", "val", "test"]:
+
+    expected_splits = ["train", "val", "test"]
+    available_splits = [split for split in expected_splits if split in data]
+    missing_splits = [split for split in expected_splits if split not in data]
+    if missing_splits:
+        logging.warning(
+            "Missing data splits for pre-computing embeddings: %s. "
+            "Skipping missing split(s).",
+            missing_splits,
+        )
+    if not available_splits:
+        raise ValueError(
+            "No compatible split found in data. Expected at least one of "
+            f"{expected_splits}, found keys: {sorted(data.keys())}."
+        )
+
+    use_vlm = (
+        cfg.pretrained_model.vlm if model_cls is None else getattr(pretrained_model, "vlm")
+    )
+    id2classnames = None
+    if dataset_task_type == "linear_probing" and use_vlm:
+        if not hasattr(cfg.dataset, "id_to_classname"):
+            raise ValueError(
+                "Dataset config must provide id_to_classname when using a VLM for "
+                "pre_computing_embeddings."
+            )
+        id2classnames = _normalize_id_to_classname(dict(cfg.dataset.id_to_classname))
+
+    for split in available_splits:
         split_dataset = PatchDataset(
             data[split]["images"],
             data[split]["labels"],
@@ -100,15 +153,7 @@ def pre_computing_patch_embeddings(
             dataset_task_type,
             device,
             id2classnames=(
-                dict(cfg.dataset.id_to_classname)
-                if dataset_task_type == "linear_probing"
-                and (
-                    cfg.pretrained_model.vlm
-                    if model_cls is None
-                    else pretrained_model.vlm
-                )
-                and split == "test"
-                else None
+                id2classnames if id2classnames is not None and split == "test" else None
             ),
             div_patches=hasattr(cfg.dataset, "div_patches") and cfg.dataset.div_patches,
         )
@@ -163,7 +208,7 @@ def pre_computing_patch_embeddings_split(
             if div_patches:
                 # Re-shaping and masking
                 bs, nb_patches, c, h, w = imgs.shape
-                masks = imgs.sum(dim=[2, 3, 4]) != 0
+                patch_masks = imgs.sum(dim=[2, 3, 4]) != 0
                 imgs = imgs.view(-1, c, h, w)
 
             embeds = extract_embedding(imgs, pretrained_model, task_type=task_type)
@@ -171,9 +216,10 @@ def pre_computing_patch_embeddings_split(
             if div_patches:
                 # Mean pooling
                 embeds = embeds.view(bs, nb_patches, embeds.shape[-1])
-                masks = masks.unsqueeze(-1)
-                masks = masks.repeat(1, 1, embeds.shape[-1])
-                embeds = (masks * embeds).sum(dim=1) / masks.sum(dim=1)
+                expanded_patch_masks = patch_masks.unsqueeze(-1).expand_as(embeds)
+                embeds = (expanded_patch_masks * embeds).sum(dim=1) / (
+                    expanded_patch_masks.sum(dim=1).clamp_min(1)
+                )
 
             embeds = embeds.cpu().numpy().astype(np.float32, copy=False)
             labels = labels.cpu().numpy().astype(np.int64, copy=False)
@@ -186,6 +232,16 @@ def pre_computing_patch_embeddings_split(
                     task_type=task_type,
                     text_aligned_im_emb=True,
                 )
+                if div_patches:
+                    text_aligned_embeds = text_aligned_embeds.view(
+                        bs, nb_patches, text_aligned_embeds.shape[-1]
+                    )
+                    expanded_patch_masks = patch_masks.unsqueeze(-1).expand_as(
+                        text_aligned_embeds
+                    )
+                    text_aligned_embeds = (
+                        expanded_patch_masks * text_aligned_embeds
+                    ).sum(dim=1) / (expanded_patch_masks.sum(dim=1).clamp_min(1))
                 text_aligned_embeds = (
                     text_aligned_embeds.cpu().numpy().astype(np.float32, copy=False)
                 )
@@ -219,10 +275,7 @@ def pre_computing_patch_embeddings_split(
 
         text_emb_path = os.path.join(embeddings_folder, "text_embeddings.h5")
         with h5py.File(text_emb_path, "a", libver="latest") as text_emb_h5:
-            next_idx = max((int(k) for k in text_emb_h5.keys()), default=-1) + 1
-            nb_classes = len(list(id2classnames.keys()))
-            for i in range(nb_classes):
-                classname = id2classnames[i]
+            for class_id, classname in id2classnames.items():
                 text_prompts = [
                     template.replace("CLASSNAME", classname)
                     for template in UtilsConstants.VLM_TEMPLATES.value
@@ -233,7 +286,9 @@ def pre_computing_patch_embeddings_split(
                 text_embed = text_embeds.mean(dim=0)
                 text_embed = text_embed.cpu().numpy().astype(np.float32, copy=False)
 
-                key = f"{i}"
+                key = f"{class_id}"
+                if key in text_emb_h5:
+                    del text_emb_h5[key]
                 text_emb_h5.create_dataset(
                     key,
                     data=text_embed,

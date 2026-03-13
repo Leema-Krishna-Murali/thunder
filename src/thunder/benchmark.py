@@ -1,6 +1,37 @@
+import os
 from typing import Callable
 
 from omegaconf import DictConfig
+
+
+def _ensure_path_component(name: str, value: str | None) -> str:
+    """Ensure a path component used in os.path.join is valid."""
+    if value is None:
+        raise ValueError(
+            f"`{name}` is None. This usually means the corresponding config value is "
+            "missing. Please check your dataset/model/task configuration."
+        )
+    if isinstance(value, str) and value.strip() == "":
+        raise ValueError(
+            f"`{name}` is empty. Please provide a non-empty value in configuration."
+        )
+    return value
+
+
+def _resolve_base_embeddings_folder(base_embeddings_folder: str | None) -> str:
+    """Resolve embeddings base folder and provide actionable error messages."""
+    if base_embeddings_folder is not None and str(base_embeddings_folder).strip() != "":
+        return base_embeddings_folder
+
+    thunder_base_data_folder = os.environ.get("THUNDER_BASE_DATA_FOLDER")
+    if thunder_base_data_folder:
+        return os.path.join(thunder_base_data_folder, "embeddings")
+
+    raise ValueError(
+        "`cfg.task.base_embeddings_folder` is missing and "
+        "`THUNDER_BASE_DATA_FOLDER` is not set. "
+        "Set `THUNDER_BASE_DATA_FOLDER` or provide `task.base_embeddings_folder`."
+    )
 
 
 def benchmark(
@@ -114,7 +145,6 @@ def run_benchmark(cfg: DictConfig, model_cls: Callable = None) -> None:
     """
 
     import logging
-    import os
     import shutil
 
     import h5py
@@ -146,15 +176,20 @@ def run_benchmark(cfg: DictConfig, model_cls: Callable = None) -> None:
         if hasattr(cfg.dataset, "base_data_folder")
         else None
     )
-    base_embeddings_folder = cfg.task.base_embeddings_folder
+    base_embeddings_folder = _resolve_base_embeddings_folder(
+        cfg.task.base_embeddings_folder if hasattr(cfg.task, "base_embeddings_folder") else None
+    )
     task_type = cfg.task.type
     task_compatible_adaptation_types = cfg.task.compatible_adaptation_types
     data_compatible_tasks = cfg.dataset.compatible_tasks
     adaptation_type = cfg.adaptation.type
-    dataset_name = cfg.dataset.dataset_name
+    dataset_name = _ensure_path_component(
+        "cfg.dataset.dataset_name", cfg.dataset.dataset_name
+    )
     model_name = (
         cfg.pretrained_model.model_name if model_cls is None else model_cls.name
     )
+    model_name = _ensure_path_component("model_name", model_name)
     image_pre_loading = cfg.data_loading.image_pre_loading
     embedding_pre_loading = cfg.data_loading.embedding_pre_loading
     assert task_type in data_compatible_tasks, (
