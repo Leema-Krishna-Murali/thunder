@@ -723,7 +723,13 @@ def get_openmidnight(ckpt_path: str):
     from torchvision import transforms
 
     # Model
-    model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitg14_reg", weights=None)
+    # `weights=None` can trigger a TypeError in some DINOv2 hub versions where
+    # `weights` is interpreted as a path/URL. Using `pretrained=False` is
+    # version-robust and avoids unnecessary default-weight downloads since we
+    # immediately load the OpenMidnight checkpoint afterward.
+    model = torch.hub.load(
+        "facebookresearch/dinov2", "dinov2_vitg14_reg", pretrained=False
+    )
     checkpoint = torch.load(ckpt_path, map_location="cpu")
 
     # Required because dinov2 is baseline 392 and openmidnight is baseline 224 resolution
