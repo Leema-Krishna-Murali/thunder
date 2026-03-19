@@ -722,10 +722,17 @@ def get_openmidnight(ckpt_path: str):
     """
     from torchvision import transforms
 
-    # Build architecture only; OpenMidnight weights are loaded from ckpt_path below.
-    model = torch.hub.load(
-        "facebookresearch/dinov2", "dinov2_vitg14_reg", pretrained=False
-    )
+    # Prefer architecture-only init. Some DINOv2 hub snapshots crash when
+    # `pretrained=False` maps internally to `weights=None`; in that case, fall back
+    # to the default hub call for compatibility.
+    try:
+        model = torch.hub.load(
+            "facebookresearch/dinov2", "dinov2_vitg14_reg", pretrained=False
+        )
+    except TypeError as exc:
+        if "os.PathLike object, not NoneType" not in str(exc):
+            raise
+        model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitg14_reg")
     checkpoint = torch.load(ckpt_path, map_location="cpu")
 
     # Required because dinov2 is baseline 392 and openmidnight is baseline 224 resolution
