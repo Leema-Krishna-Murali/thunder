@@ -16,3 +16,88 @@ def test_download_models(temp_env_dir):
     assert os.path.exists(
         model_path
     ), "Failed to download model (Model directory not found where expected)."
+
+
+def test_get_openmidnight_loads_arch_without_hub_weights(monkeypatch):
+    import torch
+
+    from thunder.models import pretrained_models
+
+    class DummyModel:
+        def __init__(self):
+            self.pos_embed = None
+            self.loaded_state = None
+
+        def load_state_dict(self, state_dict):
+            self.loaded_state = state_dict
+
+    dummy_model = DummyModel()
+    hub_call = {}
+    checkpoint = {"pos_embed": torch.randn(1, 257, 1536)}
+
+    def fake_hub_load(repo, model_name, **kwargs):
+        hub_call["repo"] = repo
+        hub_call["model_name"] = model_name
+        hub_call["kwargs"] = kwargs
+        return dummy_model
+
+    def fake_torch_load(path, map_location=None):
+        assert path == "/tmp/openmidnight.ckpt"
+        assert map_location == "cpu"
+        return checkpoint
+
+    monkeypatch.setattr(pretrained_models.torch.hub, "load", fake_hub_load)
+    monkeypatch.setattr(pretrained_models.torch, "load", fake_torch_load)
+
+    model, transform = pretrained_models.get_openmidnight("/tmp/openmidnight.ckpt")
+
+    assert model is dummy_model
+    assert hub_call["repo"] == "facebookresearch/dinov2"
+    assert hub_call["model_name"] == "dinov2_vitg14_reg"
+    assert hub_call["kwargs"] == {"pretrained": False}
+    assert "weights" not in hub_call["kwargs"]
+    assert isinstance(model.pos_embed, torch.nn.Parameter)
+    assert torch.equal(model.loaded_state["pos_embed"], checkpoint["pos_embed"])
+    assert callable(transform)
+
+
+def test_get_openmidnight_falls_back_for_old_dinov2_hub(monkeypatch):
+    import torch
+
+    from thunder.models import pretrained_models
+
+    class DummyModel:
+        def __init__(self):
+            self.pos_embed = None
+            self.loaded_state = None
+
+        def load_state_dict(self, state_dict):
+            self.loaded_state = state_dict
+
+    dummy_model = DummyModel()
+    calls = []
+    checkpoint = {"pos_embed": torch.randn(1, 257, 1536)}
+
+    def fake_hub_load(repo, model_name, **kwargs):
+        calls.append((repo, model_name, kwargs))
+        if kwargs == {"pretrained": False}:
+            raise TypeError("expected str, bytes or os.PathLike object, not NoneType")
+        return dummy_model
+
+    def fake_torch_load(path, map_location=None):
+        assert path == "/tmp/openmidnight.ckpt"
+        assert map_location == "cpu"
+        return checkpoint
+
+    monkeypatch.setattr(pretrained_models.torch.hub, "load", fake_hub_load)
+    monkeypatch.setattr(pretrained_models.torch, "load", fake_torch_load)
+
+    model, _ = pretrained_models.get_openmidnight("/tmp/openmidnight.ckpt")
+
+    assert model is dummy_model
+    assert calls[0] == (
+        "facebookresearch/dinov2",
+        "dinov2_vitg14_reg",
+        {"pretrained": False},
+    )
+    assert calls[1] == ("facebookresearch/dinov2", "dinov2_vitg14_reg", {})
